@@ -8,6 +8,7 @@ import (
 	"github.com/wyw14/solo-039/internal/feed"
 	"github.com/wyw14/solo-039/internal/interlock"
 	"github.com/wyw14/solo-039/internal/journal"
+	"github.com/wyw14/solo-039/internal/material"
 	"github.com/wyw14/solo-039/internal/model"
 	"github.com/wyw14/solo-039/internal/product"
 	"github.com/wyw14/solo-039/internal/reboiler"
@@ -21,6 +22,14 @@ func auditError(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+func equalFloat(a, b float64) bool {
+	diff := a - b
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= 1e-6
 }
 
 func (p *Plant) OperationalAudit() map[string]any {
@@ -302,6 +311,51 @@ func (p *Plant) OperationalAudit() map[string]any {
 	incident := incidentRegistry.Open("operational-audit", incidentMessage, revision)
 	incidentResolved := incidentRegistry.Resolve(incident.ID)
 
+	// 物料衡算：独立从持久事件流重建台账，与内存台账逐窗比对，
+	// 并汇总切窗数、修订数与结论翻转情况。
+	liveBalances := p.Material.Balances()
+	durableEvents, materialEventErr := p.FileLog.Read()
+	if materialEventErr != nil {
+		// 文件不可读时退回内存事件流。
+		durableEvents = events
+	}
+	rebuiltLedger, materialRebuildErr := RebuildMaterialLedger(durableEvents)
+	rebuiltBalances := []material.Balance(nil)
+	materialMatchesLive := true
+	if materialRebuildErr == nil {
+		rebuiltBalances = rebuiltLedger.Balances()
+		materialMatchesLive = len(rebuiltBalances) == len(liveBalances)
+		if materialMatchesLive {
+			for i := range liveBalances {
+				if rebuiltBalances[i].Window != liveBalances[i].Window ||
+					rebuiltBalances[i].Verdict != liveBalances[i].Verdict ||
+					!equalFloat(rebuiltBalances[i].Loss, liveBalances[i].Loss) {
+					materialMatchesLive = false
+					break
+				}
+			}
+		}
+	}
+	materialWindows := len(liveBalances)
+	materialAmended := 0
+	materialConclusionsOverturned := 0
+	materialLossWindows := 0
+	materialOpenWindows := 0
+	for _, b := range liveBalances {
+		if b.Amended {
+			materialAmended++
+		}
+		if b.Closed && b.OriginalVerdict != "" && !b.ConclusionHeld {
+			materialConclusionsOverturned++
+		}
+		if b.Verdict == material.VerdictLoss {
+			materialLossWindows++
+		}
+		if !b.Closed {
+			materialOpenWindows++
+		}
+	}
+
 	return map[string]any{
 		"analyzer":  map[string]any{"compatible": analyzer.Compatible(analyzerRecovery, analyzerRecovery.Calibration, analyzerRecovery.FeedRevision), "proof": analyzerProofOK, "quality_error": auditError(qualityErr), "quality_proof_error": auditError(qualityProofErr), "last_proof": analyzerClone.LastProof(), "catalog_count": analyzerCatalog.Count(revision)},
 		"campaign":  map[string]any{"phase_error": auditError(phaseErr), "revision_matches": revisionMatches, "can_route": canRoute, "advance_error": auditError(advanceErr), "lease_applied": leaseApplied, "restarted": restarted.Phase, "transitioned": transitioned.Phase, "completed": completed.Phase, "start_error": auditError(campaignStartErr), "running_error": auditError(campaignRunningErr), "history_present": historyPresent, "history_latest": historyLatest, "history_for_revision": len(historyForRevision), "history_phases": historyPhases},
@@ -315,6 +369,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 		"reflux":    map[string]any{"ramp_error": auditError(refluxRampErr), "submit_error": auditError(refluxSubmitErr), "pending": len(refluxPending), "lease": refluxLease, "next_error": auditError(refluxNextErr), "cancelled": refluxCancelled},
 		"relief":    map[string]any{"safe": reliefSafe, "shutdown_safe": shutdownSafe, "evaluation_error": auditError(reliefEvaluationErr), "evaluation_safe": reliefEvaluationSafe, "latest": reliefLatest, "latest_present": reliefLatestPresent, "failures": len(reliefFailures), "isolate_error": auditError(reliefIsolateErr)},
 		"utility":   map[string]any{"reserve_error": auditError(capacityReserveErr), "capacity_used": capacityUsed, "book_present": bookLeasePresent, "book_fenced": bookLeaseFenced, "ledger_active": len(ledgerActive), "ledger_used": ledgerUsed, "revoked": ledgerRevoked, "valid": leaseValid, "can_open": leaseCanOpen},
+		"material":  map[string]any{"windows": materialWindows, "open_windows": materialOpenWindows, "amended_windows": materialAmended, "conclusions_overturned": materialConclusionsOverturned, "loss_windows": materialLossWindows, "rebuild_error": auditError(materialRebuildErr), "matches_events": materialMatchesLive, "balances": liveBalances},
 		"service":   map[string]any{"run_error": auditError(serviceRunErr), "phase": servicePhase, "runtime_start_error": auditError(runtimeStartErr), "runtime_running": runtimeRunning, "recover_error": auditError(serviceRecoverErr), "ordered_steps": orderedSteps, "ordered_error": auditError(orderedRecoveryErr), "incident_resolved": incidentResolved, "start_failure_rate": p.Metrics.FailureRate("start")},
 	}
 }
